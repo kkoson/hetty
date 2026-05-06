@@ -12,6 +12,8 @@ const (
 	defaultAddr = ":8080"
 	// defaultAdminPath is the default path for the admin interface.
 	defaultAdminPath = "/hetty/"
+	// defaultDBPath is the default path for the database file.
+	defaultDBPath = "hetty.db"
 )
 
 // version is set at build time using ldflags.
@@ -21,7 +23,7 @@ func main() {
 	// Parse command-line flags.
 	addr := flag.String("addr", defaultAddr, "Address to listen on (e.g. :8080)")
 	adminPath := flag.String("adminPath", defaultAdminPath, "Path prefix for the admin interface")
-	dbPath := flag.String("db", "hetty.db", "Path to the database file")
+	dbPath := flag.String("db", defaultDBPath, "Path to the database file")
 	projName := flag.String("project", "", "Name of the project to open or create on startup")
 	certFile := flag.String("cert", "", "Path to the CA certificate file (PEM format)")
 	keyFile := flag.String("key", "", "Path to the CA private key file (PEM format)")
@@ -40,7 +42,8 @@ func main() {
 		os.Exit(0)
 	}
 
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
+	// Include date/time and file info in log output, but omit the date for cleaner logs.
+	log.SetFlags(log.Ltime | log.Lshortfile)
 
 	// Log startup configuration.
 	log.Printf("[INFO] Starting hetty %s", version)
