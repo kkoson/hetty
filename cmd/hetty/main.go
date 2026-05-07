@@ -13,7 +13,8 @@ const (
 	// defaultAdminPath is the default path for the admin interface.
 	defaultAdminPath = "/hetty/"
 	// defaultDBPath is the default path for the database file.
-	defaultDBPath = "hetty.db"
+	// Changed from "hetty.db" to store in a dedicated data directory.
+	defaultDBPath = "data/hetty.db"
 )
 
 // version is set at build time using ldflags.
