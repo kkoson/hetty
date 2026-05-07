@@ -56,6 +56,10 @@ func main() {
 
 	if *verbose {
 		log.Printf("[DEBUG] Verbose logging enabled")
+		// Also log all flag values when verbose is set, handy for debugging config issues.
+		flag.VisitAll(func(f *flag.Flag) {
+			log.Printf("[DEBUG] flag: -%s=%q", f.Name, f.Value)
+		})
 	}
 
 	if *projName != "" {
