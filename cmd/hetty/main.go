@@ -29,6 +29,8 @@ func main() {
 	certFile := flag.String("cert", "", "Path to the CA certificate file (PEM format)")
 	keyFile := flag.String("key", "", "Path to the CA private key file (PEM format)")
 	printVersion := flag.Bool("version", false, "Print version and exit")
+	// verbose enables more detailed log output; useful during local development.
+	verbose := flag.Bool("verbose", false, "Enable verbose logging")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: hetty [options]\n\nOptions:\n")
@@ -51,6 +53,10 @@ func main() {
 	log.Printf("[INFO] Listening on %s", *addr)
 	log.Printf("[INFO] Admin interface path: %s", *adminPath)
 	log.Printf("[INFO] Database path: %s", *dbPath)
+
+	if *verbose {
+		log.Printf("[DEBUG] Verbose logging enabled")
+	}
 
 	if *projName != "" {
 		log.Printf("[INFO] Opening project: %s", *projName)
