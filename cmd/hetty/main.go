@@ -43,8 +43,8 @@ func main() {
 		os.Exit(0)
 	}
 
-	// Include date/time and file info in log output, but omit the date for cleaner logs.
-	log.SetFlags(log.Ltime | log.Lshortfile)
+	// Use date/time and file info in log output for easier debugging.
+	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
 
 	// Log startup configuration.
 	log.Printf("[INFO] Starting hetty %s", version)
