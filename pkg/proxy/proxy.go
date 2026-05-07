@@ -1,249 +1,178 @@
+// Package proxy provides an HTTP/HTTPS proxy server for intercepting
+// and inspecting HTTP traffic.
 package proxy
 
 import (
-	"context"
-	"crypto"
 	"crypto/tls"
-	"crypto/x509"
-	"errors"
 	"fmt"
-	"math/rand"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
-	"strings"
 	"time"
-
-	"github.com/oklog/ulid"
-
-	"github.com/dstotijn/hetty/pkg/log"
 )
 
-//nolint:gosec
-var ulidEntropy = rand.New(rand.NewSource(time.Now().UnixNano()))
-
-type contextKey int
-
-const reqIDKey contextKey = 0
-
-// Proxy implements http.Handler and offers MITM behaviour for modifying
-// HTTP requests and responses.
-type Proxy struct {
-	certConfig *CertConfig
-	handler    http.Handler
-	logger     log.Logger
-
-	// TODO: Add mutex for modifier funcs.
-	reqModifiers []RequestModifyMiddleware
-	resModifiers []ResponseModifyMiddleware
-}
-
+// Config holds configuration options for the proxy server.
 type Config struct {
-	CACert *x509.Certificate
-	CAKey  crypto.PrivateKey
-	Logger log.Logger
+	// Addr is the address the proxy listens on (e.g., ":8080").
+	Addr string
+	// CAKeyFile is the path to the CA private key file used for TLS interception.
+	CAKeyFile string
+	// CACertFile is the path to the CA certificate file used for TLS interception.
+	CACertFile string
+	// OnRequest is an optional hook called when a request is intercepted.
+	OnRequest func(req *http.Request)
+	// OnResponse is an optional hook called when a response is received.
+	OnResponse func(req *http.Request, resp *http.Response)
 }
 
-// NewProxy returns a new Proxy.
-func NewProxy(cfg Config) (*Proxy, error) {
-	certConfig, err := NewCertConfig(cfg.CACert, cfg.CAKey)
-	if err != nil {
-		return nil, err
-	}
+// Proxy is an HTTP/HTTPS intercepting proxy.
+type Proxy struct {
+	config Config
+	server *http.Server
+	transport *http.Transport
+}
 
-	p := &Proxy{
-		certConfig:   certConfig,
-		reqModifiers: make([]RequestModifyMiddleware, 0),
-		resModifiers: make([]ResponseModifyMiddleware, 0),
-		logger:       cfg.Logger,
-	}
-
-	if p.logger == nil {
-		p.logger = log.NewNopLogger()
+// New creates a new Proxy with the given configuration.
+func New(cfg Config) (*Proxy, error) {
+	if cfg.Addr == "" {
+		cfg.Addr = ":8080"
 	}
 
 	transport := &http.Transport{
-		// Values taken from `http.DefaultTransport`.
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
 			Timeout:   30 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
-		ForceAttemptHTTP2:     true,
+		ForceAttemptHTTP2:     false,
 		MaxIdleConns:          100,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
-
-		// Non-default transport values.
-		DisableCompression: true,
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: false, //nolint:gosec
+		},
 	}
 
-	p.handler = &httputil.ReverseProxy{
-		Transport:      transport,
-		Director:       p.modifyRequest,
-		ModifyResponse: p.modifyResponse,
-		ErrorHandler:   p.errorHandler,
+	p := &Proxy{
+		config:    cfg,
+		transport: transport,
+	}
+
+	p.server = &http.Server{
+		Addr:         cfg.Addr,
+		Handler:      p,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  60 * time.Second,
 	}
 
 	return p, nil
 }
 
+// Start begins listening and serving proxy requests.
+func (p *Proxy) Start() error {
+	log.Printf("[INFO] Proxy server listening on %s", p.config.Addr)
+	return p.server.ListenAndServe()
+}
+
+// Close gracefully shuts down the proxy server.
+func (p *Proxy) Close() error {
+	return p.server.Close()
+}
+
+// ServeHTTP implements http.Handler and routes requests to the appropriate handler.
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodConnect {
-		p.handleConnect(w)
+		p.handleConnect(w, r)
 		return
 	}
-
-	reqID := ulid.MustNew(ulid.Timestamp(time.Now()), ulidEntropy)
-	ctx := context.WithValue(r.Context(), reqIDKey, reqID)
-	*r = *r.WithContext(ctx)
-
-	p.handler.ServeHTTP(w, r)
+	p.handleHTTP(w, r)
 }
 
-func (p *Proxy) UseRequestModifier(fn ...RequestModifyMiddleware) {
-	p.reqModifiers = append(p.reqModifiers, fn...)
-}
-
-func (p *Proxy) UseResponseModifier(fn ...ResponseModifyMiddleware) {
-	p.resModifiers = append(p.resModifiers, fn...)
-}
-
-func (p *Proxy) modifyRequest(r *http.Request) {
-	// Fix r.URL for HTTPS requests after CONNECT.
-	if r.URL.Scheme == "" {
-		r.URL.Host = r.Host
-		r.URL.Scheme = "https"
+// handleHTTP proxies a plain HTTP request to the target server.
+func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
+	if p.config.OnRequest != nil {
+		p.config.OnRequest(r)
 	}
 
-	// Setting `X-Forwarded-For` to `nil` ensures that http.ReverseProxy doesn't
-	// set this header.
-	r.Header["X-Forwarded-For"] = nil
-
-	// Strip unsupported encodings.
-	if acceptEncs := r.Header.Get("Accept-Encoding"); acceptEncs != "" {
-		directives := strings.Split(acceptEncs, ",")
-		updated := make([]string, 0, len(directives))
-
-		for _, directive := range directives {
-			stripped := strings.TrimSpace(directive)
-			if strings.HasPrefix(stripped, "*") || strings.HasPrefix(stripped, "gzip") {
-				updated = append(updated, stripped)
+	rp := &httputil.ReverseProxy{
+		Director: func(req *http.Request) {
+			// Ensure the request URL has a scheme.
+			if req.URL.Scheme == "" {
+				req.URL.Scheme = "http"
 			}
-		}
-
-		if len(updated) == 0 {
-			r.Header.Del("Accept-Encoding")
-		} else {
-			r.Header.Set("Accept-Encoding", strings.Join(updated, ", "))
-		}
+			if req.URL.Host == "" {
+				req.URL.Host = req.Host
+			}
+			req.Header.Del("Proxy-Connection")
+		},
+		Transport: p.transport,
+		ModifyResponse: func(resp *http.Response) error {
+			if p.config.OnResponse != nil {
+				p.config.OnResponse(r, resp)
+			}
+			return nil
+		},
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			log.Printf("[ERROR] Proxy HTTP error for %s: %v", r.URL, err)
+			http.Error(w, fmt.Sprintf("proxy error: %v", err), http.StatusBadGateway)
+		},
 	}
 
-	fn := nopReqModifier
+	rp.ServeHTTP(w, r)
+}
 
-	for i := len(p.reqModifiers) - 1; i >= 0; i-- {
-		fn = p.reqModifiers[i](fn)
+// handleConnect handles HTTP CONNECT tunneling for HTTPS traffic.
+func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
+	destConn, err := net.DialTimeout("tcp", r.Host, 10*time.Second)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("could not connect to target: %v", err), http.StatusBadGateway)
+		return
 	}
+	defer destConn.Close()
 
-	fn(r)
-}
-
-func (p *Proxy) modifyResponse(res *http.Response) error {
-	fn := nopResModifier
-
-	// TODO: Make decompressing gzip formatted response bodies a configurable project setting.
-	if err := gunzipResponseBody(res); err != nil {
-		return fmt.Errorf("proxy: failed to gunzip response body: %w", err)
-	}
-
-	for i := len(p.resModifiers) - 1; i >= 0; i-- {
-		fn = p.resModifiers[i](fn)
-	}
-
-	return fn(res)
-}
-
-func WithRequestID(ctx context.Context, id ulid.ULID) context.Context {
-	return context.WithValue(ctx, reqIDKey, id)
-}
-
-func RequestIDFromContext(ctx context.Context) (ulid.ULID, bool) {
-	id, ok := ctx.Value(reqIDKey).(ulid.ULID)
-	return id, ok
-}
-
-// handleConnect hijacks the incoming HTTP request and sets up an HTTP tunnel.
-// During the TLS handshake with the client, we use the proxy's CA config to
-// create a certificate on-the-fly.
-func (p *Proxy) handleConnect(w http.ResponseWriter) {
-	hj, ok := w.(http.Hijacker)
+	hijacker, ok := w.(http.Hijacker)
 	if !ok {
-		p.logger.Errorw("ResponseWriter is not a http.Hijacker.",
-			"type", fmt.Sprintf("%T", w))
-		writeError(w, http.StatusServiceUnavailable)
-
+		http.Error(w, "hijacking not supported", http.StatusInternalServerError)
 		return
 	}
 
-	w.WriteHeader(http.StatusOK)
-
-	clientConn, _, err := hj.Hijack()
+	clientConn, _, err := hijacker.Hijack()
 	if err != nil {
-		p.logger.Errorw("Hijacking client connection failed.",
-			"error", err)
-		writeError(w, http.StatusServiceUnavailable)
-
+		http.Error(w, fmt.Sprintf("hijack failed: %v", err), http.StatusInternalServerError)
 		return
 	}
 	defer clientConn.Close()
 
-	// Secure connection to client.
-	tlsConn, err := p.clientTLSConn(clientConn)
+	// Inform the client that the tunnel is established.
+	_, err = clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 	if err != nil {
-		p.logger.Errorw("Securing client connection failed.",
-			"error", err,
-			"remoteAddr", clientConn.RemoteAddr().String())
-
+		log.Printf("[ERROR] Failed to send CONNECT response: %v", err)
 		return
 	}
 
-	clientConnNotify := ConnNotify{tlsConn, make(chan struct{})}
-	l := &OnceAcceptListener{clientConnNotify.Conn}
-
-	err = http.Serve(l, p)
-	if err != nil && !errors.Is(err, ErrAlreadyAccepted) {
-		p.logger.Errorw("Serving HTTP request failed.",
-			"error", err)
+	// Bidirectionally copy data between client and destination.
+	done := make(chan struct{}, 2)
+	copy := func(dst net.Conn, src net.Conn) {
+		buf := make([]byte, 32*1024)
+		for {
+			n, err := src.Read(buf)
+			if n > 0 {
+				if _, werr := dst.Write(buf[:n]); werr != nil {
+					break
+				}
+			}
+			if err != nil {
+				break
+			}
+		}
+		done <- struct{}{}
 	}
 
-	<-clientConnNotify.closed
-}
+	go copy(destConn, clientConn)
+	go copy(clientConn, destConn)
 
-func (p *Proxy) clientTLSConn(conn net.Conn) (*tls.Conn, error) {
-	tlsConfig := p.certConfig.TLSConfig()
-
-	tlsConn := tls.Server(conn, tlsConfig)
-	if err := tlsConn.Handshake(); err != nil {
-		tlsConn.Close()
-		return nil, fmt.Errorf("handshake error: %w", err)
-	}
-
-	return tlsConn, nil
-}
-
-func (p *Proxy) errorHandler(w http.ResponseWriter, r *http.Request, err error) {
-	switch {
-	case !errors.Is(err, context.Canceled):
-		p.logger.Errorw("Failed to proxy request.",
-			"error", err)
-	case errors.Is(err, context.Canceled):
-		p.logger.Debugw("Proxy request was cancelled.")
-	}
-
-	w.WriteHeader(http.StatusBadGateway)
-}
-
-func writeError(w http.ResponseWriter, code int) {
-	http.Error(w, http.StatusText(code), code)
+	<-done
 }
