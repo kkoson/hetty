@@ -17,7 +17,8 @@ const (
 	// defaultWriteTimeout is the default timeout for writing the response.
 	defaultWriteTimeout = 30 * time.Second
 	// defaultIdleTimeout is the default timeout for idle connections.
-	defaultIdleTimeout = 60 * time.Second
+	// Increased from 60s to 120s to reduce reconnection overhead during longer sessions.
+	defaultIdleTimeout = 120 * time.Second
 )
 
 // Server represents the Hetty API HTTP server.
@@ -114,18 +115,4 @@ func (s *Server) Shutdown() error {
 }
 
 // registerRoutes sets up the HTTP routes on the given mux.
-func registerRoutes(mux *http.ServeMux, logger *zap.Logger) {
-	mux.HandleFunc("/api/health", healthHandler(logger))
-}
-
-// healthHandler returns an HTTP handler for the health-check endpoint.
-func healthHandler(logger *zap.Logger) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, err := w.Write([]byte(`{"status":"ok"}`))
-		if err != nil {
-			logger.Error("Failed to write health response", zap.Error(err))
-		}
-	}
-}
+func registerRoutes(mux *http.ServeMux, logger *za
