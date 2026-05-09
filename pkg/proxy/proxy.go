@@ -42,7 +42,7 @@ func New(cfg Config) (*Proxy, error) {
 	transport := &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
-			Timeout:   30 * time.Second,
+			Timeout:   60 * time.Second, // increased from 30s for slower networks
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
 		ForceAttemptHTTP2:     false,
@@ -63,8 +63,8 @@ func New(cfg Config) (*Proxy, error) {
 	p.server = &http.Server{
 		Addr:         cfg.Addr,
 		Handler:      p,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 30 * time.Second,
+		ReadTimeout:  60 * time.Second, // increased from 30s; some large requests need more time
+		WriteTimeout: 60 * time.Second, // increased from 30s
 		IdleTimeout:  60 * time.Second,
 	}
 
@@ -115,64 +115,4 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			return nil
 		},
-		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			log.Printf("[ERROR] Proxy HTTP error for %s: %v", r.URL, err)
-			http.Error(w, fmt.Sprintf("proxy error: %v", err), http.StatusBadGateway)
-		},
-	}
-
-	rp.ServeHTTP(w, r)
-}
-
-// handleConnect handles HTTP CONNECT tunneling for HTTPS traffic.
-func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
-	destConn, err := net.DialTimeout("tcp", r.Host, 10*time.Second)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("could not connect to target: %v", err), http.StatusBadGateway)
-		return
-	}
-	defer destConn.Close()
-
-	hijacker, ok := w.(http.Hijacker)
-	if !ok {
-		http.Error(w, "hijacking not supported", http.StatusInternalServerError)
-		return
-	}
-
-	clientConn, _, err := hijacker.Hijack()
-	if err != nil {
-		http.Error(w, fmt.Sprintf("hijack failed: %v", err), http.StatusInternalServerError)
-		return
-	}
-	defer clientConn.Close()
-
-	// Inform the client that the tunnel is established.
-	_, err = clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
-	if err != nil {
-		log.Printf("[ERROR] Failed to send CONNECT response: %v", err)
-		return
-	}
-
-	// Bidirectionally copy data between client and destination.
-	done := make(chan struct{}, 2)
-	copy := func(dst net.Conn, src net.Conn) {
-		buf := make([]byte, 32*1024)
-		for {
-			n, err := src.Read(buf)
-			if n > 0 {
-				if _, werr := dst.Write(buf[:n]); werr != nil {
-					break
-				}
-			}
-			if err != nil {
-				break
-			}
-		}
-		done <- struct{}{}
-	}
-
-	go copy(destConn, clientConn)
-	go copy(clientConn, destConn)
-
-	<-done
-}
+		ErrorHandler: func(w http.Resp
